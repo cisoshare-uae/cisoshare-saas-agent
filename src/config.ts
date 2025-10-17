@@ -7,6 +7,7 @@ export const CONFIG = {
     DATABASE_URL: process.env.DATABASE_URL || "",
     ENROLLMENT_TOKEN: process.env.ENROLLMENT_TOKEN || "unset",
     OPA_URL: process.env.OPA_URL || "",
+    AGENT_API_SECRET: process.env.AGENT_API_SECRET || "dev-secret-change-in-prod",
 
     // demo schema/policy versions to render in /health
     SCHEMA_VERSION: "v1-minimal",

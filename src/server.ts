@@ -3,6 +3,8 @@ import cors from "cors";
 import { CONFIG } from "./config";
 import { health } from "./routes/health";
 import { contacts } from "./routes/contacts";
+import { employees } from "./routes/employees";
+import { agentUsers } from "./routes/agent_users";
 import { audit } from "./routes/audit";
 
 
@@ -20,6 +22,8 @@ app.use((req, _res, next) => {
 app.use(health);
 app.use(audit);
 app.use("/contacts", contacts);
+app.use("/employees", employees);
+app.use("/agent-users", agentUsers);
 
 
 // Start

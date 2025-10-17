@@ -7,8 +7,8 @@ export type AuditInput = {
     requestId: string;
     actorRole: string;          // e.g., "admin" | "user"
     action: "create" | "list" | "update" | "delete";
-    resource: "contacts";
-    targetId?: string | null;   // contact id if applicable
+    resource: "contacts" | "employees" | "agent_users";
+    targetId?: string | null;   // contact/employee/user id if applicable
     idempotencyKey?: string | null;
 
     decision: "allow" | "deny" | "n/a"; // OPA decision or n/a for reads/creates when not gated
