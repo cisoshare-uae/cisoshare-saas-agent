@@ -2,10 +2,11 @@ import express from "express";
 import cors from "cors";
 import { CONFIG } from "./config";
 import { health } from "./routes/health";
-import { contacts } from "./routes/contacts";
-import { employees } from "./routes/employees";
 import { agentUsers } from "./routes/agent_users";
 import { audit } from "./routes/audit";
+import { internalEmployeesRouter } from "./routes/internal/hr/employees";
+import { internalDocumentsRouter } from "./routes/internal/documents";
+import { internalTemplatesRouter } from "./routes/internal/templates";
 
 
 // Add near the top (after imports) to generate simple correlation ids
@@ -21,9 +22,14 @@ app.use((req, _res, next) => {
 // Mount routes
 app.use(health);
 app.use(audit);
-app.use("/contacts", contacts);
-app.use("/employees", employees);
+// OLD route - deprecated in favor of /agent/internal/employees
+// app.use("/employees", employees);
 app.use("/agent-users", agentUsers);
+
+// Internal API routes (standardized Agent API contract)
+app.use("/agent/internal/employees", internalEmployeesRouter);
+app.use("/agent/internal/documents", internalDocumentsRouter);
+app.use("/agent/internal/templates", internalTemplatesRouter);
 
 
 // Start

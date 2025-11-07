@@ -15,6 +15,8 @@
 /data
 sample-trade-license.pdf
 /instructions
+/src/scripts
+/scripts
 
 # next.js
 /.next/
@@ -22,6 +24,7 @@ sample-trade-license.pdf
 
 # production
 /build
+/migrations-old
 
 # misc
 .DS_Store

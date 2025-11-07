@@ -1,0 +1,586 @@
+-- Migration: 012_document_management_system.sql
+-- Description: Comprehensive document management system with versioning, approvals, expiry tracking, and audit logging
+-- Date: 2025-01-04
+-- ADHICS Compliance: AC (Access Control), DP (Data Privacy), IM (Information Management), SA (Security Audit)
+
+-- =====================================================
+-- 1. CORE DOCUMENTS TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS documents (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+
+  -- Document Identity
+  document_number VARCHAR(64) UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+
+  -- Classification
+  entity_type VARCHAR(32) NOT NULL CHECK (entity_type IN (
+    'employee', 'vendor', 'policy', 'general', 'contract', 'certificate'
+  )),
+  entity_id UUID, -- References employees.id, vendors.id, etc.
+  category VARCHAR(64) NOT NULL,
+  tags TEXT[], -- Array of tags for better organization
+
+  -- File Storage (encrypted on disk)
+  file_name TEXT NOT NULL,
+  file_size BIGINT NOT NULL,
+  file_type VARCHAR(32) NOT NULL,
+  file_path TEXT NOT NULL, -- Path on agent storage
+  file_hash VARCHAR(128), -- SHA-256 hash for integrity verification
+  mime_type VARCHAR(128),
+  is_encrypted BOOLEAN DEFAULT TRUE,
+  encryption_key_id VARCHAR(128), -- Reference to encryption key (not the key itself)
+
+  -- Version Control
+  version INTEGER NOT NULL DEFAULT 1,
+  parent_document_id UUID REFERENCES documents(id) ON DELETE SET NULL,
+  is_latest_version BOOLEAN DEFAULT TRUE,
+  change_summary TEXT,
+  superseded_by UUID REFERENCES documents(id) ON DELETE SET NULL,
+
+  -- Status & Lifecycle
+  status VARCHAR(32) NOT NULL DEFAULT 'draft' CHECK (status IN (
+    'draft', 'pending_review', 'under_review', 'pending_approval',
+    'approved', 'published', 'archived', 'expired', 'rejected', 'disposed'
+  )),
+
+  -- Expiry & Renewal Management
+  issue_date DATE,
+  expiry_date DATE,
+  renewal_required BOOLEAN DEFAULT FALSE,
+  renewal_period_days INTEGER, -- How many days before expiry to start renewal
+  grace_period_days INTEGER DEFAULT 0,
+  last_renewal_notification_date DATE,
+  auto_archive_on_expiry BOOLEAN DEFAULT FALSE,
+
+  -- Classification & Compliance
+  contains_pii BOOLEAN DEFAULT FALSE,
+  contains_phi BOOLEAN DEFAULT FALSE,
+  sensitivity_level VARCHAR(32) DEFAULT 'internal' CHECK (sensitivity_level IN (
+    'public', 'internal', 'confidential', 'restricted', 'highly_restricted'
+  )),
+  retention_period_years INTEGER,
+  legal_hold BOOLEAN DEFAULT FALSE,
+  legal_hold_reason TEXT,
+  disposal_date DATE,
+
+  -- AI Extraction
+  ai_extracted_data JSONB,
+  ai_extraction_status VARCHAR(32) CHECK (ai_extraction_status IN (
+    'pending', 'processing', 'completed', 'failed', 'not_applicable'
+  )),
+  ai_extraction_confidence DECIMAL(3,2), -- 0.00 to 1.00
+  ai_extraction_date TIMESTAMPTZ,
+  ai_model_version VARCHAR(32),
+
+  -- Metadata
+  custom_metadata JSONB, -- Flexible metadata storage
+
+  -- Audit Fields
+  created_by UUID NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_by UUID,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ, -- Soft delete
+
+  -- Indexes will be created below
+  CONSTRAINT valid_expiry_dates CHECK (expiry_date IS NULL OR issue_date IS NULL OR expiry_date > issue_date)
+);
+
+-- Indexes for documents table
+CREATE INDEX IF NOT EXISTS idx_documents_tenant_id ON documents(tenant_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents(entity_type, entity_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_expiry ON documents(expiry_date) WHERE deleted_at IS NULL AND expiry_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_document_number ON documents(document_number);
+CREATE INDEX IF NOT EXISTS idx_documents_latest_version ON documents(is_latest_version) WHERE is_latest_version = TRUE AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_tags ON documents USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_documents_ai_extracted_data ON documents USING GIN(ai_extracted_data);
+
+-- =====================================================
+-- 2. DOCUMENT APPROVALS TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_approvals (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+  -- Approval Workflow
+  approval_level INTEGER NOT NULL DEFAULT 1, -- Multi-level approval support
+  approval_type VARCHAR(32) NOT NULL DEFAULT 'sequential' CHECK (approval_type IN ('sequential', 'parallel')),
+
+  -- Approver Information
+  approver_id UUID NOT NULL,
+  approver_role VARCHAR(64),
+
+  -- Approval Status
+  status VARCHAR(32) NOT NULL DEFAULT 'pending' CHECK (status IN (
+    'pending', 'approved', 'rejected', 'skipped', 'escalated'
+  )),
+
+  -- Decision Details
+  decision_date TIMESTAMPTZ,
+  comments TEXT,
+  rejection_reason TEXT,
+
+  -- Delegation
+  delegated_to UUID,
+  delegated_at TIMESTAMPTZ,
+  delegation_reason TEXT,
+
+  -- Escalation
+  escalated_to UUID,
+  escalated_at TIMESTAMPTZ,
+  escalation_reason TEXT,
+
+  -- SLA Tracking
+  requested_at TIMESTAMPTZ DEFAULT NOW(),
+  due_date TIMESTAMPTZ,
+  reminder_sent_at TIMESTAMPTZ,
+
+  -- Audit
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_approvals_document ON document_approvals(document_id);
+CREATE INDEX IF NOT EXISTS idx_document_approvals_approver ON document_approvals(approver_id, status);
+CREATE INDEX IF NOT EXISTS idx_document_approvals_status ON document_approvals(status);
+CREATE INDEX IF NOT EXISTS idx_document_approvals_due_date ON document_approvals(due_date) WHERE status = 'pending';
+
+-- =====================================================
+-- 3. DOCUMENT RELATIONSHIPS TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_relationships (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+
+  source_document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  target_document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+  relationship_type VARCHAR(32) NOT NULL CHECK (relationship_type IN (
+    'references', 'supersedes', 'amends', 'supplements',
+    'related', 'parent', 'child', 'depends_on'
+  )),
+
+  description TEXT,
+
+  created_by UUID NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+
+  CONSTRAINT no_self_reference CHECK (source_document_id != target_document_id),
+  CONSTRAINT unique_relationship UNIQUE (source_document_id, target_document_id, relationship_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_relationships_source ON document_relationships(source_document_id);
+CREATE INDEX IF NOT EXISTS idx_document_relationships_target ON document_relationships(target_document_id);
+CREATE INDEX IF NOT EXISTS idx_document_relationships_type ON document_relationships(relationship_type);
+
+-- =====================================================
+-- 4. DOCUMENT ACCESS LOG TABLE (AUDIT TRAIL)
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_access_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+  -- Access Details
+  user_id UUID NOT NULL,
+  user_email VARCHAR(255),
+  user_role VARCHAR(64),
+
+  -- Action Information
+  action VARCHAR(64) NOT NULL CHECK (action IN (
+    'view', 'download', 'upload', 'update', 'delete', 'approve', 'reject',
+    'share', 'print', 'export', 'version_create', 'archive', 'restore'
+  )),
+  action_details JSONB, -- Additional action metadata
+
+  -- Request Context
+  ip_address INET,
+  user_agent TEXT,
+  request_id VARCHAR(128),
+
+  -- Result
+  success BOOLEAN DEFAULT TRUE,
+  error_message TEXT,
+
+  -- Timestamp
+  accessed_at TIMESTAMPTZ DEFAULT NOW(),
+
+  -- Retention (for ADHICS compliance - 7 years)
+  retention_until DATE DEFAULT (CURRENT_DATE + INTERVAL '7 years')
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_access_log_document ON document_access_log(document_id, accessed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_document_access_log_user ON document_access_log(user_id, accessed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_document_access_log_action ON document_access_log(action, accessed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_document_access_log_tenant ON document_access_log(tenant_id, accessed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_document_access_log_retention ON document_access_log(retention_until);
+
+-- =====================================================
+-- 5. DOCUMENT COMMENTS TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_comments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+  -- Comment Details
+  parent_comment_id UUID REFERENCES document_comments(id) ON DELETE CASCADE, -- For threaded comments
+  comment_text TEXT NOT NULL,
+  comment_type VARCHAR(32) DEFAULT 'general' CHECK (comment_type IN (
+    'general', 'review', 'approval', 'question', 'suggestion', 'issue'
+  )),
+
+  -- Author
+  author_id UUID NOT NULL,
+  author_name VARCHAR(255),
+  author_role VARCHAR(64),
+
+  -- Status
+  is_resolved BOOLEAN DEFAULT FALSE,
+  resolved_by UUID,
+  resolved_at TIMESTAMPTZ,
+
+  -- Visibility
+  is_internal BOOLEAN DEFAULT FALSE, -- Internal comments not visible to external parties
+
+  -- Attachments
+  has_attachments BOOLEAN DEFAULT FALSE,
+  attachments JSONB, -- Array of attachment references
+
+  -- Audit
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_comments_document ON document_comments(document_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_document_comments_author ON document_comments(author_id);
+CREATE INDEX IF NOT EXISTS idx_document_comments_parent ON document_comments(parent_comment_id);
+CREATE INDEX IF NOT EXISTS idx_document_comments_resolved ON document_comments(is_resolved) WHERE deleted_at IS NULL;
+
+-- =====================================================
+-- 6. DOCUMENT NOTIFICATIONS TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_notifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+  -- Notification Type
+  notification_type VARCHAR(64) NOT NULL CHECK (notification_type IN (
+    'expiry_warning_90', 'expiry_warning_60', 'expiry_warning_30', 'expiry_warning_7',
+    'expired', 'renewal_required', 'approval_requested', 'approval_approved',
+    'approval_rejected', 'document_updated', 'document_shared', 'comment_added',
+    'review_required', 'grace_period_ending'
+  )),
+
+  -- Recipient
+  recipient_id UUID NOT NULL,
+  recipient_email VARCHAR(255),
+  recipient_role VARCHAR(64),
+
+  -- Notification Content
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  priority VARCHAR(32) DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+
+  -- Delivery Channels
+  send_email BOOLEAN DEFAULT TRUE,
+  send_in_app BOOLEAN DEFAULT TRUE,
+  send_sms BOOLEAN DEFAULT FALSE,
+
+  -- Status
+  status VARCHAR(32) DEFAULT 'pending' CHECK (status IN (
+    'pending', 'sent', 'delivered', 'failed', 'read'
+  )),
+
+  -- Timestamps
+  scheduled_at TIMESTAMPTZ DEFAULT NOW(),
+  sent_at TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+  read_at TIMESTAMPTZ,
+  failed_at TIMESTAMPTZ,
+  failure_reason TEXT,
+
+  -- Retry Logic
+  retry_count INTEGER DEFAULT 0,
+  max_retries INTEGER DEFAULT 3,
+  next_retry_at TIMESTAMPTZ,
+
+  -- Metadata
+  metadata JSONB,
+
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_notifications_document ON document_notifications(document_id);
+CREATE INDEX IF NOT EXISTS idx_document_notifications_recipient ON document_notifications(recipient_id, status);
+CREATE INDEX IF NOT EXISTS idx_document_notifications_status ON document_notifications(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_document_notifications_type ON document_notifications(notification_type);
+CREATE INDEX IF NOT EXISTS idx_document_notifications_scheduled ON document_notifications(scheduled_at) WHERE status = 'pending';
+
+-- =====================================================
+-- 7. DOCUMENT TEMPLATES TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_templates (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+
+  -- Template Identity
+  template_name VARCHAR(255) NOT NULL,
+  template_code VARCHAR(64) UNIQUE NOT NULL, -- e.g., 'EMP_CONTRACT_001'
+  description TEXT,
+
+  -- Template Category
+  category VARCHAR(64) NOT NULL,
+  entity_type VARCHAR(32) NOT NULL,
+
+  -- Template File
+  template_file_path TEXT NOT NULL,
+  template_file_type VARCHAR(32) NOT NULL, -- pdf, docx, xlsx, etc.
+
+  -- Variables/Placeholders
+  variables JSONB, -- Array of variable definitions with validation rules
+
+  -- Settings
+  is_active BOOLEAN DEFAULT TRUE,
+  require_approval BOOLEAN DEFAULT FALSE,
+  default_approval_workflow JSONB, -- Default approval workflow configuration
+
+  -- Expiry Settings
+  has_expiry BOOLEAN DEFAULT FALSE,
+  default_validity_days INTEGER,
+  default_renewal_period_days INTEGER,
+
+  -- Usage Stats
+  usage_count INTEGER DEFAULT 0,
+  last_used_at TIMESTAMPTZ,
+
+  -- Version
+  version INTEGER DEFAULT 1,
+
+  -- Audit
+  created_by UUID NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_by UUID,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_templates_tenant ON document_templates(tenant_id) WHERE deleted_at IS NULL AND is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_document_templates_category ON document_templates(category) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_document_templates_code ON document_templates(template_code);
+
+-- =====================================================
+-- 8. DOCUMENT SHARES TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_shares (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+
+  -- Sharing Details
+  shared_by UUID NOT NULL,
+  shared_with_user_id UUID, -- Internal user
+  shared_with_email VARCHAR(255), -- External email
+  share_type VARCHAR(32) DEFAULT 'view' CHECK (share_type IN ('view', 'download', 'comment', 'edit')),
+
+  -- Access Control
+  access_token VARCHAR(128) UNIQUE, -- For external sharing
+  password_protected BOOLEAN DEFAULT FALSE,
+  password_hash VARCHAR(255),
+
+  -- Expiry
+  expires_at TIMESTAMPTZ,
+  max_access_count INTEGER,
+  current_access_count INTEGER DEFAULT 0,
+
+  -- Status
+  is_active BOOLEAN DEFAULT TRUE,
+  revoked_at TIMESTAMPTZ,
+  revoked_by UUID,
+  revocation_reason TEXT,
+
+  -- Audit
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  last_accessed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_shares_document ON document_shares(document_id);
+CREATE INDEX IF NOT EXISTS idx_document_shares_user ON document_shares(shared_with_user_id);
+CREATE INDEX IF NOT EXISTS idx_document_shares_token ON document_shares(access_token) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_document_shares_expiry ON document_shares(expires_at) WHERE is_active = TRUE;
+
+-- =====================================================
+-- 9. DOCUMENT CATEGORIES TABLE (CONFIGURATION)
+-- =====================================================
+CREATE TABLE IF NOT EXISTS document_categories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+
+  -- Category Details
+  category_code VARCHAR(64) NOT NULL,
+  category_name VARCHAR(255) NOT NULL,
+  description TEXT,
+  entity_type VARCHAR(32) NOT NULL,
+
+  -- Validation Rules
+  required_fields JSONB, -- Array of required metadata fields
+  validation_schema JSONB, -- JSON schema for validation
+
+  -- Default Settings
+  default_retention_years INTEGER,
+  default_sensitivity VARCHAR(32),
+  require_approval BOOLEAN DEFAULT FALSE,
+  require_ai_extraction BOOLEAN DEFAULT FALSE,
+
+  -- Display
+  icon VARCHAR(64),
+  color VARCHAR(32),
+  sort_order INTEGER DEFAULT 0,
+
+  -- Status
+  is_active BOOLEAN DEFAULT TRUE,
+
+  -- Audit
+  created_by UUID NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+  CONSTRAINT unique_category UNIQUE (tenant_id, category_code, entity_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_categories_tenant ON document_categories(tenant_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_document_categories_entity ON document_categories(entity_type, is_active);
+
+-- =====================================================
+-- FUNCTIONS AND TRIGGERS
+-- =====================================================
+
+-- Function to update updated_at timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger for documents
+CREATE TRIGGER update_documents_updated_at BEFORE UPDATE ON documents
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for document_approvals
+CREATE TRIGGER update_document_approvals_updated_at BEFORE UPDATE ON document_approvals
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for document_comments
+CREATE TRIGGER update_document_comments_updated_at BEFORE UPDATE ON document_comments
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for document_templates
+CREATE TRIGGER update_document_templates_updated_at BEFORE UPDATE ON document_templates
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for document_categories
+CREATE TRIGGER update_document_categories_updated_at BEFORE UPDATE ON document_categories
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Function to mark older versions as not latest when new version is created
+CREATE OR REPLACE FUNCTION update_document_version_status()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.parent_document_id IS NOT NULL AND NEW.is_latest_version = TRUE THEN
+    -- Mark all other versions of this document (same parent chain) as not latest
+    UPDATE documents
+    SET is_latest_version = FALSE
+    WHERE (id = NEW.parent_document_id OR parent_document_id = NEW.parent_document_id)
+      AND id != NEW.id
+      AND is_latest_version = TRUE;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER ensure_single_latest_version AFTER INSERT ON documents
+  FOR EACH ROW EXECUTE FUNCTION update_document_version_status();
+
+-- Function to increment document usage count in templates
+CREATE OR REPLACE FUNCTION increment_template_usage()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.ai_extracted_data ? 'template_id' THEN
+    UPDATE document_templates
+    SET usage_count = usage_count + 1,
+        last_used_at = NOW()
+    WHERE id = (NEW.ai_extracted_data->>'template_id')::UUID;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER track_template_usage AFTER INSERT ON documents
+  FOR EACH ROW EXECUTE FUNCTION increment_template_usage();
+
+-- =====================================================
+-- SEED DEFAULT DOCUMENT CATEGORIES
+-- =====================================================
+
+-- Employee Document Categories
+INSERT INTO document_categories (tenant_id, category_code, category_name, description, entity_type, default_retention_years, require_approval, is_active, created_by)
+VALUES
+  ('00000000-0000-0000-0000-000000000000', 'EMP_CONTRACT', 'Employment Contract', 'Employment agreements and contracts', 'employee', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'EMP_NDA', 'Non-Disclosure Agreement', 'Employee NDAs and confidentiality agreements', 'employee', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'EMP_BGV', 'Background Verification', 'Background check and verification documents', 'employee', 7, false, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'EMP_CERT_ACADEMIC', 'Academic Certificate', 'Educational certificates and degrees', 'employee', 10, false, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'EMP_LICENSE', 'Professional License', 'Professional licenses and certifications', 'employee', 5, false, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'EMP_TRAINING', 'Training Certificate', 'Training completion certificates', 'employee', 3, false, true, '00000000-0000-0000-0000-000000000000')
+ON CONFLICT (tenant_id, category_code, entity_type) DO NOTHING;
+
+-- Vendor Document Categories
+INSERT INTO document_categories (tenant_id, category_code, category_name, description, entity_type, default_retention_years, require_approval, is_active, created_by)
+VALUES
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_CONTRACT', 'Vendor Contract', 'Vendor service agreements and contracts', 'vendor', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_SLA', 'Service Level Agreement', 'SLA documents defining service standards', 'vendor', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_DPA', 'Data Processing Agreement', 'Data protection and processing agreements', 'vendor', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_NDA', 'Vendor NDA', 'Vendor non-disclosure agreements', 'vendor', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_INSURANCE', 'Insurance Certificate', 'Vendor insurance documents', 'vendor', 5, false, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_LICENSE', 'Trade License', 'Business licenses and permits', 'vendor', 5, false, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'VENDOR_CERT', 'Certification', 'Quality and compliance certifications', 'vendor', 3, false, true, '00000000-0000-0000-0000-000000000000')
+ON CONFLICT (tenant_id, category_code, entity_type) DO NOTHING;
+
+-- Policy Document Categories
+INSERT INTO document_categories (tenant_id, category_code, category_name, description, entity_type, default_retention_years, require_approval, is_active, created_by)
+VALUES
+  ('00000000-0000-0000-0000-000000000000', 'POLICY_GENERAL', 'General Policy', 'General organizational policies', 'policy', 10, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'POLICY_SECURITY', 'Security Policy', 'Information security policies', 'policy', 10, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'POLICY_HR', 'HR Policy', 'Human resources policies', 'policy', 10, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'POLICY_PROCEDURE', 'Procedure', 'Standard operating procedures', 'policy', 7, true, true, '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000000', 'POLICY_GUIDELINE', 'Guideline', 'Operational guidelines', 'policy', 5, false, true, '00000000-0000-0000-0000-000000000000')
+ON CONFLICT (tenant_id, category_code, entity_type) DO NOTHING;
+
+-- =====================================================
+-- COMMENTS AND DOCUMENTATION
+-- =====================================================
+
+COMMENT ON TABLE documents IS 'Core document storage with versioning, encryption, and lifecycle management';
+COMMENT ON TABLE document_approvals IS 'Multi-level approval workflow tracking for documents';
+COMMENT ON TABLE document_relationships IS 'Links and relationships between documents';
+COMMENT ON TABLE document_access_log IS 'Comprehensive audit trail for all document access (ADHICS SA compliance)';
+COMMENT ON TABLE document_comments IS 'Collaboration comments and reviews on documents';
+COMMENT ON TABLE document_notifications IS 'Automated notification system for document events';
+COMMENT ON TABLE document_templates IS 'Reusable document templates with variable substitution';
+COMMENT ON TABLE document_shares IS 'Document sharing with internal and external parties';
+COMMENT ON TABLE document_categories IS 'Document category configuration with validation rules';
+
+COMMENT ON COLUMN documents.contains_pii IS 'Flags documents containing Personally Identifiable Information';
+COMMENT ON COLUMN documents.contains_phi IS 'Flags documents containing Protected Health Information';
+COMMENT ON COLUMN documents.legal_hold IS 'Prevents deletion when under legal hold';
+COMMENT ON COLUMN documents.encryption_key_id IS 'Reference to encryption key (AES-256-GCM)';
+COMMENT ON COLUMN document_access_log.retention_until IS 'ADHICS requires 7 years audit log retention';
