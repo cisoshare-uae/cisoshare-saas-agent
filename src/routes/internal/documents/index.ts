@@ -14,6 +14,7 @@ import { documentRelationshipsRouter } from './relationships';
 import { editorRouter } from './editor';
 import { sectionsRouter } from './sections';
 import { complianceRouter } from './compliance';
+import { parserLogRouter } from './parser-log';
 
 // Create combined router
 const router = Router();
@@ -31,10 +32,11 @@ router.use('/:documentId/relationships', documentRelationshipsRouter);
 router.use('/relationships', documentRelationshipsRouter); // For relationship-specific operations
 router.use('/versions/compare', documentVersionsRouter); // For version comparison
 
-// Mount editor, sections, and compliance routes
+// Mount editor, sections, compliance, and parser-log routes
 router.use('/:documentId/editor', editorRouter);
 router.use('/:documentId/sections', sectionsRouter);
 router.use('/:documentId/compliance', complianceRouter);
+router.use('/:documentId/parser-log', parserLogRouter);
 
 // Export the combined router
 export { router as internalDocumentsRouter };
